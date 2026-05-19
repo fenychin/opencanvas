@@ -13,6 +13,7 @@ import asyncio
 import logging
 import requests
 import zipfile
+import mimetypes
 from typing import List, Dict, Any, Optional
 from threading import Lock
 import httpx
@@ -1234,12 +1235,12 @@ async def wait_for_image_task(client, task_id, provider=None):
         response.raise_for_status()
         last_payload = response.json()
         task_data = last_payload.get("data") if isinstance(last_payload.get("data"), dict) else last_payload
-        status = str(task_data.get("status", "")).upper()
-        if status in {"SUCCESS", "COMPLETED"}:
+        status = str(task_data.get("status") or task_data.get("task_status") or "").upper()
+        if status in {"SUCCESS", "SUCCEED", "SUCCEEDED", "COMPLETED", "COMPLETE", "DONE", "FINISHED", "OK", "READY"}:
             return last_payload
-        if status in {"FAILURE", "FAILED", "ERROR"}:
+        if status in {"FAILURE", "FAILED", "FAIL", "ERROR", "ERRORED", "CANCELED", "CANCELLED", "TIMEOUT", "REJECTED", "EXPIRED"}:
             error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
-            reason = task_data.get("fail_reason") or error.get("message") or last_payload.get("message") or "生图任务失败"
+            reason = task_data.get("fail_reason") or task_data.get("message") or error.get("message") or last_payload.get("message") or "生图任务失败"
             raise HTTPException(status_code=502, detail=f"生图任务失败：{reason}")
         await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     raise HTTPException(status_code=504, detail=f"生图任务超时（已等待 {int(timeout)} 秒），task_id={task_id}")
@@ -1476,38 +1477,94 @@ def extract_apimart_asset_url(payload):
             return found
     return ""
 
+def apimart_upload_payload_from_bytes(data: bytes, mime: str, name_hint: str = "image"):
+    """把内存中的图片字节按 APIMart 的 10MB 限制压缩为可上传 payload。"""
+    max_bytes = 9_500_000
+    ext = mimetypes.guess_extension(mime or "image/png") or ".png"
+    if len(data) <= max_bytes and (mime or "").lower() in ("image/png", "image/jpeg", "image/webp"):
+        return f"{name_hint}{ext}", data, (mime or "image/png")
+    with Image.open(BytesIO(data)) as img:
+        has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+        if has_alpha:
+            base = img.convert("RGBA")
+            bg = Image.new("RGB", base.size, (255, 255, 255))
+            bg.paste(base, mask=base.split()[-1])
+            target = bg
+        else:
+            target = img.convert("RGB")
+        quality = 92
+        while quality >= 62:
+            buf = BytesIO()
+            target.save(buf, format="JPEG", quality=quality, optimize=True)
+            payload = buf.getvalue()
+            if len(payload) <= max_bytes:
+                return f"{name_hint}.jpg", payload, "image/jpeg"
+            quality -= 8
+    raise ValueError("data URL 图片超过 10MB，且压缩后仍无法满足 APIMart 限制")
+
 async def upload_image_for_apimart(client, provider, ref_url: str) -> str:
     """把本地图片转成上游可接受的输入。
     按 APIMart 文档上传到 /v1/uploads/images，拿到可用于生成接口的 http/https URL。
-    绝不把 /output/* 或 /assets/* 这类本地路径直接传给上游。"""
+    绝不把 /output/* 或 /assets/* 这类本地路径直接传给上游。
+    返回上游可用 URL；返回值以 "ERR:" 开头表示具体失败原因（供前端展示）。"""
     ref_url = str(ref_url or "").strip()
     if not ref_url:
-        return ref_url
+        return "ERR:空地址"
     # 已经是网络 URL 或 asset:// → 直接可用，无需上传
     if ref_url.startswith("http://") or ref_url.startswith("https://") or ref_url.startswith("asset://"):
         return ref_url
-    # 当前 APIMart 视频接口只接受 http(s) 或 asset://，不接受 data:image。
+    base_url = video_api_root(provider)
+    upload_url = f"{base_url}/v1/uploads/images"
+    # data URL: 解码后直接上传到 APIMart
     if ref_url.startswith("data:"):
-        return ""
-    path = output_file_from_url(ref_url)
-    if not path:
-        return ""  # 无法解析成本地文件时，避免把无效本地路径传给上游
-    try:
-        base_url = video_api_root(provider)
-        upload_url = f"{base_url}/v1/uploads/images"
-        filename, content, ct = apimart_upload_file_payload(path)
-        files = {"file": (filename, content, ct)}
-        resp = await client.post(upload_url, headers=api_headers(json_body=False, provider=provider), files=files, timeout=60)
-        if resp.status_code in (200, 201):
-            rj = resp.json()
-            url = extract_apimart_asset_url(rj)
-            if valid_apimart_video_image_input(url):
-                return url
-            print(f"APIMart 文件上传返回中未找到可用 asset/url: {str(rj)[:300]}")
-        print(f"APIMart 文件上传失败 ({resp.status_code}): {resp.text[:300]}")
-    except Exception as e:
-        print(f"APIMart 文件上传异常: {e}")
-    return ""
+        try:
+            if ";base64," not in ref_url:
+                return "ERR:不支持的 data URL（缺少 base64 段）"
+            header, encoded = ref_url.split(";base64,", 1)
+            mime = header.split(":", 1)[1].split(";", 1)[0] if ":" in header else "image/png"
+            raw = base64.b64decode(encoded)
+            filename, content, ct = apimart_upload_payload_from_bytes(raw, mime, name_hint="canvas_image")
+            files = {"file": (filename, content, ct)}
+            resp = await client.post(upload_url, headers=api_headers(json_body=False, provider=provider), files=files, timeout=60)
+            if resp.status_code in (200, 201):
+                rj = resp.json()
+                url = extract_apimart_asset_url(rj)
+                if valid_apimart_video_image_input(url):
+                    return url
+                print(f"APIMart 上传 data URL 返回中未找到可用 asset/url: {str(rj)[:300]}")
+                return "ERR:APIMart 上传响应未包含可用 URL"
+            print(f"APIMart 上传 data URL 失败 ({resp.status_code}): {resp.text[:300]}")
+            return f"ERR:APIMart 上传失败({resp.status_code})"
+        except ValueError as e:
+            return f"ERR:{e}"
+        except Exception as e:
+            print(f"APIMart 上传 data URL 异常: {e}")
+            return f"ERR:上传异常 {e}"
+    # 本地 /output/ 或 /assets/ 路径：先确认文件存在再上传
+    if ref_url.startswith("/output/") or ref_url.startswith("/assets/"):
+        path = output_file_from_url(ref_url)
+        if not path:
+            print(f"APIMart 上传跳过：本地文件不存在 {ref_url}")
+            return "ERR:本地文件不存在或已被删除"
+        try:
+            filename, content, ct = apimart_upload_file_payload(path)
+            files = {"file": (filename, content, ct)}
+            resp = await client.post(upload_url, headers=api_headers(json_body=False, provider=provider), files=files, timeout=60)
+            if resp.status_code in (200, 201):
+                rj = resp.json()
+                url = extract_apimart_asset_url(rj)
+                if valid_apimart_video_image_input(url):
+                    return url
+                print(f"APIMart 文件上传返回中未找到可用 asset/url: {str(rj)[:300]}")
+                return "ERR:APIMart 上传响应未包含可用 URL"
+            print(f"APIMart 文件上传失败 ({resp.status_code}): {resp.text[:300]}")
+            return f"ERR:APIMart 上传失败({resp.status_code})"
+        except ValueError as e:
+            return f"ERR:{e}"
+        except Exception as e:
+            print(f"APIMart 文件上传异常: {e}")
+            return f"ERR:上传异常 {e}"
+    return "ERR:不支持的图片来源（仅支持 http/https/asset/data 或本地 /output/ /assets/ 路径）"
 
 async def save_ai_image_to_output(image_data, prefix="online_", category="output"):
     filename = f"{prefix}{uuid.uuid4().hex[:10]}.png"
@@ -2275,37 +2332,58 @@ async def get_canvas_image_task(task_id: str):
 
 # --- Canvas Video ---
 
+VIDEO_URL_KEYS = (
+    "url", "video_url", "videoUrl", "mp4_url", "mp4Url",
+    "output", "output_url", "outputUrl", "download_url", "downloadUrl",
+    "video", "src", "uri", "preview_url", "previewUrl",
+)
+
+def _collect_video_url(value, urls):
+    if not value:
+        return
+    if isinstance(value, str):
+        if value.startswith("http://") or value.startswith("https://") or value.startswith("/output/") or value.startswith("/assets/"):
+            urls.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_video_url(item, urls)
+        return
+    if isinstance(value, dict):
+        for key in VIDEO_URL_KEYS:
+            if key in value:
+                _collect_video_url(value.get(key), urls)
+
 def video_output_urls(raw):
-    data = raw.get("data") if isinstance(raw, dict) else {}
-    if isinstance(data, list) and data:
-        data = data[0] if isinstance(data[0], dict) else {}
-    if not isinstance(data, dict):
-        data = {}
     urls = []
-    result = data.get("result") if isinstance(data.get("result"), dict) else raw.get("result") if isinstance(raw, dict) and isinstance(raw.get("result"), dict) else {}
-    output = data.get("output") or raw.get("output")
-    outputs = data.get("outputs") or raw.get("outputs") or []
-    videos = result.get("videos") or data.get("videos") or raw.get("videos") or []
-    if isinstance(output, str) and output:
-        urls.append(output)
-    if isinstance(outputs, list):
-        for item in outputs:
-            if isinstance(item, str) and item:
-                urls.append(item)
-            elif isinstance(item, dict):
-                value = item.get("url") or item.get("output")
-                if value:
-                    urls.extend(value if isinstance(value, list) else [value])
-    if isinstance(videos, list):
-        for item in videos:
-            if isinstance(item, str) and item:
-                urls.append(item)
-            elif isinstance(item, dict):
-                value = item.get("url") or item.get("video_url") or item.get("output")
-                if value:
-                    urls.extend(value if isinstance(value, list) else [value])
-    elif isinstance(videos, str) and videos:
-        urls.append(videos)
+    if not isinstance(raw, dict):
+        return urls
+    candidates = [raw]
+    data = raw.get("data")
+    if isinstance(data, dict):
+        candidates.append(data)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                candidates.append(item)
+    for node in list(candidates):
+        result = node.get("result") if isinstance(node, dict) else None
+        if isinstance(result, dict):
+            candidates.append(result)
+        elif isinstance(result, list):
+            for item in result:
+                if isinstance(item, dict):
+                    candidates.append(item)
+    for node in candidates:
+        if not isinstance(node, dict):
+            continue
+        for key in ("videos", "outputs"):
+            value = node.get(key)
+            if value:
+                _collect_video_url(value, urls)
+        for key in VIDEO_URL_KEYS:
+            if key in node:
+                _collect_video_url(node.get(key), urls)
     deduped = []
     for url in urls:
         if isinstance(url, str) and url and url not in deduped:
@@ -2317,6 +2395,15 @@ def video_api_root(provider):
     if base_url.endswith("/v1") or base_url.endswith("/v2"):
         base_url = base_url.rsplit("/", 1)[0]
     return base_url
+
+VIDEO_TASK_SUCCESS_STATUSES = {
+    "SUCCESS", "SUCCEED", "SUCCEEDED", "COMPLETED", "COMPLETE",
+    "DONE", "FINISHED", "FINISH", "OK", "READY",
+}
+VIDEO_TASK_FAILURE_STATUSES = {
+    "FAILURE", "FAILED", "FAIL", "ERROR", "ERRORED",
+    "CANCELED", "CANCELLED", "TIMEOUT", "TIMEDOUT", "REJECTED", "EXPIRED",
+}
 
 async def wait_for_video_task(client, provider, task_id):
     base_url = video_api_root(provider)
@@ -2337,12 +2424,15 @@ async def wait_for_video_task(client, provider, task_id):
         raw = response.json()
         last_payload = raw
         task_data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
-        status = str(task_data.get("status") or raw.get("status") or "").upper()
-        if status in {"SUCCESS", "COMPLETED"}:
+        status = str(task_data.get("status") or task_data.get("task_status") or raw.get("status") or raw.get("task_status") or "").upper()
+        if status in VIDEO_TASK_SUCCESS_STATUSES:
             return raw
-        if status in {"FAILURE", "FAILED", "FAIL", "ERROR", "CANCELED", "CANCELLED", "TIMEOUT"}:
+        # 部分上游不返回标准 status 字段，但已经返回了视频 URL —— 直接当成功处理
+        if not status and video_output_urls(raw):
+            return raw
+        if status in VIDEO_TASK_FAILURE_STATUSES:
             error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
-            reason = task_data.get("fail_reason") or error.get("message") or raw.get("error") or raw.get("message") or str(raw)
+            reason = task_data.get("fail_reason") or task_data.get("message") or error.get("message") or raw.get("error") or raw.get("message") or str(raw)
             raise HTTPException(status_code=502, detail=f"视频生成任务失败：{reason}")
         delay = min(delay * 1.6, 12)
     raise HTTPException(status_code=504, detail=f"视频生成任务超时：{last_payload or task_id}")
@@ -2373,7 +2463,7 @@ async def canvas_video(payload: CanvasVideoRequest):
             if is_apimart:
                 # APIMart 只接受 http/https 或 asset:// URL，先上传本地图片取回网络 URL
                 image_with_roles = []
-                invalid_images = []
+                invalid_images = []  # 每项为 (原始 URL, 失败原因)
                 apimart_model = apimart_veo31_model(requested_model) if is_veo31 else ""
                 if apimart_model == "veo3.1-lite" and payload.images:
                     raise HTTPException(status_code=400, detail="veo3.1-lite 不支持图片输入，请改用 veo3.1-fast 或 veo3.1-quality。")
@@ -2387,7 +2477,8 @@ async def canvas_video(payload: CanvasVideoRequest):
                         if valid_apimart_video_image_input(up_url):
                             image_with_roles.append({"url": up_url, "role": role})
                         else:
-                            invalid_images.append(ref.url)
+                            reason = up_url[4:] if isinstance(up_url, str) and up_url.startswith("ERR:") else "未知错误"
+                            invalid_images.append((ref.url, reason))
                 image_payload = []
                 if not image_with_roles:
                     for ref in payload.images[:image_limit]:
@@ -2397,10 +2488,12 @@ async def canvas_video(payload: CanvasVideoRequest):
                         if valid_apimart_video_image_input(up_url):
                             image_payload.append(up_url)
                         else:
-                            invalid_images.append(ref.url)
+                            reason = up_url[4:] if isinstance(up_url, str) and up_url.startswith("ERR:") else "未知错误"
+                            invalid_images.append((ref.url, reason))
                 if payload.images and not image_with_roles and not image_payload:
-                    sample = invalid_video_image_preview(invalid_images[0] if invalid_images else "")
-                    raise HTTPException(status_code=400, detail=f"输入图片无法转换为视频接口支持的格式：{sample}。请确认本地文件存在，且图片不超过 10MB；VEO3.1 需要先上传为 APIMart 可访问的 http/https 或 asset:// 图片。")
+                    first_url, first_reason = invalid_images[0] if invalid_images else ("", "未知错误")
+                    sample = invalid_video_image_preview(first_url)
+                    raise HTTPException(status_code=400, detail=f"输入图片无法转换为视频接口支持的格式：{sample}\n原因：{first_reason}\n请确认本地文件存在且不超过 10MB；VEO3.1 需要图片是 APIMart 可访问的 http/https / asset:// / data URL。")
                 # --- APIMart 请求体 ---
                 if is_veo31:
                     model = apimart_model
