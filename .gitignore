@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL archive folder
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak
+env.destination
+
+# Project local dynamic folders (user generated content & DB)
+data/
+assets/
+output/
+API/.env
+
+# Editor & OS files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db

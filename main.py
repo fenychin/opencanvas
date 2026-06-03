@@ -70,6 +70,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def disable_cache_middleware(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static") or path.startswith("/output") or path.startswith("/assets") or path == "/":
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 # --- WebSocket 状态管理器 ---
 class ConnectionManager:
     def __init__(self):
@@ -6398,146 +6408,7 @@ async def runninghub_upload_asset(payload: RunningHubUploadAssetRequest):
         return {"success": True, "data": {"fileName": raw["data"]["fileName"], "fileType": raw["data"].get("fileType") or content_type}}
     raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 上传失败：{raw}")
 
-@app.get("/api/jimeng/status")
-async def jimeng_status():
-    exe = jimeng_cli_executable()
-    if not exe:
-        return {"installed": False, "logged_in": False, "message": "未找到 dreamina CLI"}
-    version, version_text = await jimeng_cli_version()
-    version_str = ".".join(str(part) for part in version) if version else None
-    version_ok = version >= JIMENG_MIN_CLI_VERSION if version else None
-    min_version_str = ".".join(str(part) for part in JIMENG_MIN_CLI_VERSION)
-    try:
-        raw = await run_jimeng_cli(["user_credit"], timeout=30)
-        return {
-            "installed": True,
-            "logged_in": True,
-            "raw": raw,
-            "cli_version": version_str,
-            "version_ok": version_ok,
-            "min_version": min_version_str,
-        }
-    except HTTPException as exc:
-        return {
-            "installed": True,
-            "logged_in": False,
-            "message": str(exc.detail),
-            "cli_version": version_str,
-            "version_ok": version_ok,
-            "min_version": min_version_str,
-        }
 
-@app.get("/api/jimeng/credit")
-async def jimeng_credit():
-    raw = await run_jimeng_cli(["user_credit"], timeout=30)
-    return {"success": True, "raw": raw}
-
-@app.post("/api/jimeng/logout")
-async def jimeng_logout():
-    raw = await run_jimeng_cli(["logout"], timeout=30)
-    return {"success": True, "raw": raw}
-
-@app.post("/api/jimeng/login/start")
-async def jimeng_login_start():
-    old_proc = JIMENG_LOGIN_SESSION.get("proc")
-    if old_proc and getattr(old_proc, "returncode", None) is None:
-        try:
-            old_proc.terminate()
-        except Exception:
-            pass
-    exe = jimeng_cli_executable()
-    if not exe:
-        raise HTTPException(status_code=400, detail="未找到 dreamina CLI")
-    JIMENG_LOGIN_SESSION.update({"proc": None, "stdout": "", "stderr": "", "started_at": time.time()})
-    args = ["login", "--headless"]
-    command = jimeng_command(args, exe)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=BASE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=400, detail=f"未找到即梦 CLI：{exe}") from exc
-    JIMENG_LOGIN_SESSION["proc"] = proc
-    asyncio.create_task(jimeng_login_reader(proc))
-    await asyncio.sleep(2)
-    text = jimeng_login_text()
-    if proc.returncode not in (None, 0) and ("unknown" in text.lower() or "no such option" in text.lower()):
-        # 旧版 CLI 可能没有 --headless，退回 debug 输出。
-        JIMENG_LOGIN_SESSION.update({"proc": None, "stdout": "", "stderr": "", "started_at": time.time()})
-        proc = await asyncio.create_subprocess_exec(
-            *jimeng_command(["login", "--debug"], exe),
-            cwd=BASE_DIR,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        JIMENG_LOGIN_SESSION["proc"] = proc
-        asyncio.create_task(jimeng_login_reader(proc))
-        await asyncio.sleep(2)
-        text = jimeng_login_text()
-    return {
-        "success": True,
-        "running": JIMENG_LOGIN_SESSION.get("proc") is not None and JIMENG_LOGIN_SESSION["proc"].returncode is None,
-        "text": text,
-        "qr_url": jimeng_login_qr_from_text(text),
-        "started_at": JIMENG_LOGIN_SESSION.get("started_at") or 0,
-    }
-
-@app.get("/api/jimeng/login/status")
-async def jimeng_login_status():
-    proc = JIMENG_LOGIN_SESSION.get("proc")
-    text = jimeng_login_text()
-    running = proc is not None and getattr(proc, "returncode", None) is None
-    logged_in = False
-    credit_raw = None
-    if not running:
-        try:
-            credit_raw = await run_jimeng_cli(["user_credit"], timeout=20)
-            logged_in = True
-        except HTTPException:
-            logged_in = False
-    return {
-        "success": True,
-        "running": running,
-        "logged_in": logged_in,
-        "text": text,
-        "qr_url": jimeng_login_qr_from_text(text),
-        "raw": credit_raw,
-    }
-
-@app.post("/api/jimeng/help")
-async def jimeng_help(payload: JimengHelpRequest):
-    command = str(payload.command or "").strip()
-    allowed = {"", "login", "logout", "user_credit", "text2image", "image2image", "image_upscale", "text2video", "image2video", "multimodal2video", "frames2video", "multiframe2video", "list_task", "query_result"}
-    if command not in allowed:
-        raise HTTPException(status_code=400, detail="不支持的帮助命令")
-    args = [command, "-h"] if command else ["-h"]
-    raw = await run_jimeng_cli(args, timeout=30, raw_text=True)
-    text = raw.get("_stdout") or ""
-    if raw.get("_stderr"):
-        text = f"{text}\n{raw.get('_stderr')}".strip()
-    return {"success": True, "command": command, "text": text, "raw": raw}
-
-@app.post("/api/jimeng/query-media")
-async def jimeng_query_media(payload: JimengQueryMediaRequest):
-    """按 submit_id 续查即梦任务：出图返回 succeeded+urls；仍排队返回 pending+queue_info；失败返回 failed。
-    供画布「排队中」卡片自动轮询与手动查询复用。"""
-    submit_id = str(payload.submit_id or "").strip()
-    if not submit_id:
-        raise HTTPException(status_code=400, detail="缺少 submit_id")
-    kind = str(payload.kind or "image").strip().lower()
-    if kind not in ("image", "video", "audio"):
-        kind = "image"
-    queried = await jimeng_query_result(submit_id, kind)
-    try:
-        urls = await jimeng_store_outputs(queried, kind, allow_query=False)
-        return {"status": "succeeded", "submit_id": submit_id, "kind": kind, "urls": urls}
-    except JimengPendingError as exc:
-        return {"status": "pending", "submit_id": submit_id, "kind": kind, "queue_info": exc.queue_info, "message": jimeng_pending_payload(exc)["message"]}
-    except HTTPException as exc:
-        return {"status": "failed", "submit_id": submit_id, "kind": kind, "error": str(getattr(exc, "detail", "") or exc)}
 
 @app.get("/api/config")
 async def ai_config():
@@ -9729,188 +9600,12 @@ def runninghub_collect_workflow_fields(workflow_json):
             })
     return fields
 
-class ComfyInstancesPayload(BaseModel):
-    instances: List[str] = []
+# --- APIRouter Mounts ---
+from routers.comfyui import router as comfyui_router
+from routers.jimeng import router as jimeng_router
+app.include_router(comfyui_router)
+app.include_router(jimeng_router)
 
-@app.get("/api/comfyui/instances")
-def get_comfyui_instances():
-    return {"instances": COMFYUI_INSTANCES}
-
-@app.put("/api/comfyui/instances")
-def save_comfyui_instances(payload: ComfyInstancesPayload):
-    # 宽容校验：去前后空白、去 http(s):// 前缀、去尾部斜杠；要求形如 host:port
-    cleaned = []
-    for item in payload.instances:
-        s = str(item or "").strip()
-        if not s:
-            continue
-        s = re.sub(r"^https?://", "", s)
-        s = s.rstrip("/")
-        if ":" not in s:
-            raise HTTPException(status_code=400, detail=f"地址缺少端口号：{item}（应为 host:port，例如 127.0.0.1:8188）")
-        host, _, port = s.rpartition(":")
-        if not host or not port.isdigit():
-            raise HTTPException(status_code=400, detail=f"地址不合法：{item}（应为 host:port，例如 127.0.0.1:8188）")
-        if s in cleaned:
-            continue
-        cleaned.append(s)
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="至少保留一个 ComfyUI 后端地址")
-    # 写入 env 文件
-    try:
-        update_env_values({"COMFYUI_INSTANCES": ",".join(cleaned)})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"写入 env 失败：{e}")
-    # 更新进程中的全局变量
-    global COMFYUI_INSTANCES, COMFYUI_ADDRESS, BACKEND_LOCAL_LOAD
-    COMFYUI_INSTANCES = cleaned
-    COMFYUI_ADDRESS = cleaned[0]
-    new_load = {addr: 0 for addr in cleaned}
-    for addr, n in (BACKEND_LOCAL_LOAD or {}).items():
-        if addr in new_load:
-            new_load[addr] = n
-    BACKEND_LOCAL_LOAD = new_load
-    return {"instances": COMFYUI_INSTANCES}
-
-@app.get("/api/workflows")
-def list_workflows():
-    if not os.path.isdir(WORKFLOW_DIR):
-        return {"workflows": []}
-    items = []
-    for root, dirs, files in os.walk(WORKFLOW_DIR):
-        if os.path.abspath(root) == os.path.abspath(WORKFLOW_DIR):
-            dirs[:] = [d for d in dirs if d in {CUSTOM_WORKFLOW_FOLDER, LEGACY_CUSTOM_WORKFLOW_FOLDER}]
-        for fn in sorted(files):
-            if not fn.endswith(".json") or fn.endswith(".config.json"):
-                continue
-            rel = os.path.relpath(os.path.join(root, fn), WORKFLOW_DIR).replace("\\", "/")
-            if is_builtin_workflow(rel):
-                continue
-            cfg = {}
-            cfg_path = workflow_config_path(rel)
-            if os.path.exists(cfg_path):
-                try:
-                    with open(cfg_path, "r", encoding="utf-8") as f:
-                        cfg = json.load(f) or {}
-                except Exception:
-                    cfg = {}
-            items.append({
-                "name": rel,
-                "title": cfg.get("title") or fn.replace(".json", ""),
-                "builtin": False,
-                "field_count": len(cfg.get("fields") or []),
-            })
-    items.sort(key=lambda item: (0 if item["name"].startswith(f"{CUSTOM_WORKFLOW_FOLDER}/") else 1, item["title"]))
-    return {"workflows": items}
-
-@app.get("/api/workflows/{name:path}")
-def get_workflow(name: str):
-    if not WORKFLOW_NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="Invalid workflow name")
-    workflow_path = workflow_path_from_name(name)
-    if not os.path.exists(workflow_path):
-        raise HTTPException(status_code=404, detail="Workflow not found")
-    with open(workflow_path, "r", encoding="utf-8") as f:
-        workflow = json.load(f)
-    cfg = {"title": name.replace(".json", ""), "fields": []}
-    cfg_path = workflow_config_path(name)
-    if os.path.exists(cfg_path):
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f) or cfg
-        except Exception:
-            pass
-    return {"name": name, "workflow": workflow, "config": cfg, "builtin": is_builtin_workflow(name)}
-
-@app.post("/api/workflows")
-def upload_workflow(payload: WorkflowUploadRequest):
-    name = os.path.basename(payload.name.strip())
-    if not name.endswith(".json"):
-        name = name + ".json"
-    if not WORKFLOW_NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="工作流名称不合法，请使用中文/英文/数字/_-.")
-    if not isinstance(payload.workflow, dict) or not payload.workflow:
-        raise HTTPException(status_code=400, detail="工作流 JSON 为空")
-    # 简单校验：是 API 格式（节点 id 为 key，含 class_type）
-    sample = next(iter(payload.workflow.values()), None)
-    if not isinstance(sample, dict) or "class_type" not in sample:
-        raise HTTPException(status_code=400, detail="不是有效的 ComfyUI API 工作流 JSON（需包含 class_type）")
-    custom_dir = os.path.join(WORKFLOW_DIR, CUSTOM_WORKFLOW_FOLDER)
-    os.makedirs(custom_dir, exist_ok=True)
-    stored_name = f"{CUSTOM_WORKFLOW_FOLDER}/{name}"
-    path = workflow_path_from_name(stored_name)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload.workflow, f, ensure_ascii=False, indent=2)
-    return {"name": stored_name}
-
-@app.put("/api/workflows/{name:path}/config")
-def save_workflow_config(name: str, payload: WorkflowConfig):
-    if not WORKFLOW_NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="Invalid workflow name")
-    workflow_path = workflow_path_from_name(name)
-    if not os.path.exists(workflow_path):
-        raise HTTPException(status_code=404, detail="Workflow not found")
-    cfg_path = workflow_config_path(name)
-    with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump(payload.dict(), f, ensure_ascii=False, indent=2)
-    return {"config": payload.dict()}
-
-@app.delete("/api/workflows/{name:path}")
-def delete_workflow(name: str):
-    if not WORKFLOW_NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="Invalid workflow name")
-    if is_builtin_workflow(name):
-        raise HTTPException(status_code=400, detail="内置工作流不可删除")
-    workflow_path = workflow_path_from_name(name)
-    cfg_path = workflow_config_path(name)
-    if not os.path.exists(workflow_path):
-        raise HTTPException(status_code=404, detail="Workflow not found")
-    os.remove(workflow_path)
-    if os.path.exists(cfg_path):
-        os.remove(cfg_path)
-    return {"ok": True}
-
-@app.post("/api/workflows/{name:path}/run")
-def run_workflow(name: str, payload: WorkflowRunRequest):
-    if not WORKFLOW_NAME_RE.match(name):
-        raise HTTPException(status_code=400, detail="Invalid workflow name")
-    if not os.path.exists(workflow_path_from_name(name)):
-        raise HTTPException(status_code=404, detail="Workflow not found")
-    # 根据 config 的字段把值映射成 params 节点覆盖
-    params: Dict[str, Dict[str, Any]] = {}
-    for field in payload.config.fields:
-        if not field.node or not field.input:
-            continue
-        if field.id in payload.fields:
-            value = payload.fields[field.id]
-            # 类型转换
-            if field.type in ("number", "slider"):
-                try:
-                    value = float(value) if (field.step and field.step < 1) else int(float(value))
-                except Exception:
-                    pass
-            elif field.type == "boolean":
-                value = bool(value)
-            elif field.type == "dropdown":
-                # 下拉值如果看起来是数字（如 "1024" / "2048" / "0.8"），自动转成 int/float
-                if isinstance(value, str):
-                    s = value.strip()
-                    try:
-                        if s and ('.' in s or 'e' in s.lower()):
-                            value = float(s)
-                        elif s and (s.lstrip('-').isdigit()):
-                            value = int(s)
-                    except (ValueError, TypeError):
-                        pass
-            params.setdefault(field.node, {})[field.input] = value
-    req = GenerateRequest(
-        prompt="",
-        workflow_json=name,
-        params=params,
-        type="workflow-test",
-        client_id=payload.client_id or str(uuid.uuid4()),
-    )
-    return generate(req)
 
 if __name__ == "__main__":
     import uvicorn
