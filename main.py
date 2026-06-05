@@ -9507,23 +9507,97 @@ def runninghub_collect_workflow_fields(workflow_json):
     return fields
 
 # --- 用户鉴权 (注册/登录) API ---
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
+
+# 内存验证码缓存
+VERIFICATION_CODES: Dict[str, Dict[str, Any]] = {}
+
+def send_verification_email(email: str, code: str) -> bool:
+    smtp_host = os.getenv("SMTP_HOST", "")
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+    smtp_user = os.getenv("SMTP_USER", "")
+    smtp_pass = os.getenv("SMTP_PASSWORD", "")
+    
+    subject = "OpenCanvas 注册验证码"
+    body = f"您的验证码是：{code}，请在 5 分钟内完成注册。如非本人操作请忽略。"
+    
+    # 打印到服务器控制台，以支持免 SMTP 零门槛开发调试
+    print(f"\n========================================\n[AUTH CODE] Verification code for {email} is: {code}\n========================================\n")
+    
+    if not smtp_host or not smtp_user or not smtp_pass:
+        return True
+        
+    try:
+        message = MIMEText(body, 'plain', 'utf-8')
+        message['From'] = Header(f"OpenCanvas <{smtp_user}>", 'utf-8')
+        message['To'] = Header(email, 'utf-8')
+        message['Subject'] = Header(subject, 'utf-8')
+        
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=10)
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
+            server.starttls()
+            
+        server.login(smtp_user, smtp_pass)
+        server.sendmail(smtp_user, [email], message.as_string())
+        server.quit()
+        return True
+    except Exception as e:
+        print(f"发送验证码邮件失败: {e}")
+        return False
+
+class SendCodePayload(BaseModel):
+    email: str
+
 class RegisterPayload(BaseModel):
     email: str
     password: str
+    code: str
 
 class LoginPayload(BaseModel):
     email: str
     password: str
 
+@app.post("/api/auth/send-code")
+async def send_code(payload: SendCodePayload):
+    email = payload.email.strip().lower()
+    if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+        raise HTTPException(status_code=400, detail="邮箱格式不正确")
+        
+    code = "".join([str(random.randint(0, 9)) for _ in range(6)])
+    VERIFICATION_CODES[email] = {
+        "code": code,
+        "expires_at": time.time() + 300
+    }
+    
+    success = send_verification_email(email, code)
+    if not success and os.getenv("SMTP_HOST"):
+        raise HTTPException(status_code=500, detail="验证码发送失败，请稍后重试")
+        
+    return {"success": True, "msg": "验证码已发送"}
+
 @app.post("/api/auth/register")
 async def register(payload: RegisterPayload):
     email = payload.email.strip().lower()
     password = payload.password
+    code = payload.code.strip()
     
     if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="密码长度必须至少为6位")
+        
+    # 校验验证码
+    cached = VERIFICATION_CODES.get(email)
+    if not cached:
+        raise HTTPException(status_code=400, detail="请先获取验证码")
+    if time.time() > cached["expires_at"]:
+        raise HTTPException(status_code=400, detail="验证码已过期")
+    if cached["code"] != code:
+        raise HTTPException(status_code=400, detail="验证码不正确")
         
     db = SessionLocal()
     try:
@@ -9542,6 +9616,9 @@ async def register(payload: RegisterPayload):
         )
         db.add(new_user)
         db.commit()
+        
+        # 清除验证码缓存
+        VERIFICATION_CODES.pop(email, None)
         
         from core.auth import create_access_token
         token = create_access_token({"sub": user_id})

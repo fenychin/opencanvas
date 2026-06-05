@@ -15,8 +15,9 @@ from core.models import User
 # JWT 身份验证方案 (不抛出强制错误，以便支持本地开发回退机制)
 security_scheme = HTTPBearer(auto_error=False)
 
-# 是否强制开启安全鉴权 (生产环境下部署必须在环境变量中设置为 True)
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "false").lower() == "true"
+# 是否强制开启安全鉴权 (生产与开发环境均默认为 True，强制用户登录后使用)
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").lower() == "true"
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:

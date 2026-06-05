@@ -41,6 +41,12 @@
             injectLoginModal();
             injectStatusPill();
             updateAuthState();
+            
+            // 强制使用：如果无 Token，立即打开登录框且无法关闭
+            const token = localStorage.getItem("auth_token");
+            if (!token) {
+                showLoginModal();
+            }
         });
     }
 
@@ -54,9 +60,9 @@
             .apple-auth-overlay {
                 position: fixed;
                 top: 0; left: 0; right: 0; bottom: 0;
-                background: rgba(0, 0, 0, 0.4);
-                backdrop-filter: blur(25px);
-                -webkit-backdrop-filter: blur(25px);
+                background: rgba(0, 0, 0, 0.6);
+                backdrop-filter: blur(35px);
+                -webkit-backdrop-filter: blur(35px);
                 z-index: 99999;
                 display: flex;
                 align-items: center;
@@ -157,27 +163,16 @@
                 text-align: center;
                 display: none;
             }
-            .apple-auth-close {
-                position: absolute;
-                top: 20px; right: 20px;
-                color: #86868b;
-                cursor: pointer;
-                font-size: 20px;
-                transition: color 0.2s;
-            }
-            .apple-auth-close:hover {
-                color: #ffffff;
-            }
-            /* 右上角登录胶囊挂件 */
+            /* 左下角状态胶囊 */
             .apple-status-pill {
                 position: fixed;
-                top: 15px;
-                right: 15px;
+                bottom: 235px; /* 定位到左下角侧边栏按钮上方 */
+                left: 20px;
                 background: rgba(28, 28, 30, 0.75);
                 border: 1px solid rgba(255, 255, 255, 0.1);
                 backdrop-filter: blur(15px);
                 -webkit-backdrop-filter: blur(15px);
-                padding: 8px 14px;
+                padding: 10px 16px;
                 border-radius: 20px;
                 display: flex;
                 align-items: center;
@@ -196,16 +191,16 @@
             .apple-status-dot {
                 width: 6px; height: 6px;
                 border-radius: 50%;
-                background: #ff453a; /* 未登录为红点 */
+                background: #ff453a;
             }
             .apple-status-dot.active {
-                background: #30d158; /* 已登录为绿点 */
+                background: #30d158;
             }
         `;
         document.head.appendChild(style);
     }
 
-    // 动态注入模态框 HTML
+    // 动态注入模态框 HTML (移除关闭按钮以强制使用)
     function injectLoginModal() {
         if (document.getElementById("apple-auth-overlay")) return;
         const overlay = document.createElement("div");
@@ -213,7 +208,6 @@
         overlay.className = "apple-auth-overlay";
         overlay.innerHTML = `
             <div class="apple-auth-card" style="position: relative;">
-                <div class="apple-auth-close" id="apple-auth-close-btn">&times;</div>
                 <div class="apple-auth-title" id="apple-auth-card-title">登录 OpenCanvas</div>
                 <div class="apple-auth-error" id="apple-auth-error-msg"></div>
                 <form id="apple-auth-form" onsubmit="return false;">
@@ -221,6 +215,16 @@
                         <label class="apple-auth-label">电子邮箱</label>
                         <input type="email" class="apple-auth-input" id="apple-auth-email" placeholder="example@domain.com" required>
                     </div>
+                    
+                    <!-- 验证码容器，注册时显示 -->
+                    <div class="apple-auth-group" id="apple-auth-code-group" style="display:none; position: relative;">
+                        <label class="apple-auth-label">验证码</label>
+                        <div style="display: flex; gap: 10px;">
+                            <input type="text" class="apple-auth-input" id="apple-auth-code" placeholder="6位数字" style="flex: 1;">
+                            <button type="button" class="apple-auth-btn" id="apple-auth-send-btn" style="width: auto; margin-top: 0; padding: 12px 16px; white-space: nowrap; background: rgba(255,255,255,0.1); color: #fff; border: 1px solid rgba(255,255,255,0.15);">获取验证码</button>
+                        </div>
+                    </div>
+
                     <div class="apple-auth-group">
                         <label class="apple-auth-label">密码</label>
                         <input type="password" class="apple-auth-input" id="apple-auth-password" placeholder="••••••••" required>
@@ -242,36 +246,100 @@
         const switchBox = document.getElementById("apple-auth-switch-box");
         const errorEl = document.getElementById("apple-auth-error-msg");
         const formEl = document.getElementById("apple-auth-form");
+        const codeGroup = document.getElementById("apple-auth-code-group");
+        const codeInput = document.getElementById("apple-auth-code");
+        const sendBtn = document.getElementById("apple-auth-send-btn");
 
+        // 切换登录/注册模式
         switchBtn.addEventListener("click", () => {
             isLoginMode = !isLoginMode;
             errorEl.style.display = "none";
             if (isLoginMode) {
                 titleEl.textContent = "登录 OpenCanvas";
                 submitBtn.textContent = "登录";
+                codeGroup.style.display = "none";
+                codeInput.required = false;
                 switchBox.innerHTML = `没有账户？<span id="apple-auth-switch-btn">立即注册</span>`;
             } else {
                 titleEl.textContent = "注册新账户";
                 submitBtn.textContent = "注册";
+                codeGroup.style.display = "block";
+                codeInput.required = true;
                 switchBox.innerHTML = `已有账户？<span id="apple-auth-switch-btn">立即登录</span>`;
             }
-            // 重新绑定动态生成节点的事件
             document.getElementById("apple-auth-switch-btn").onclick = switchBtn.click;
         });
 
-        document.getElementById("apple-auth-close-btn").addEventListener("click", hideLoginModal);
+        // 获取验证码事件 (带倒计时)
+        sendBtn.addEventListener("click", async () => {
+            const email = document.getElementById("apple-auth-email").value.trim();
+            if (!email || !email.includes("@")) {
+                alert("请输入有效的电子邮箱地址");
+                return;
+            }
+            
+            // 启动 60 秒倒计时
+            let countdown = 60;
+            sendBtn.disabled = true;
+            sendBtn.textContent = `${countdown}s 后重试`;
+            const timer = setInterval(() => {
+                countdown--;
+                if (countdown <= 0) {
+                    clearInterval(timer);
+                    sendBtn.disabled = false;
+                    sendBtn.textContent = "获取验证码";
+                } else {
+                    sendBtn.textContent = `${countdown}s 后重试`;
+                }
+            }, 1000);
 
+            try {
+                const res = await originalFetch("/api/auth/send-code", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ email })
+                });
+                
+                let data = {};
+                if (res.headers.get("content-type")?.includes("application/json")) {
+                    data = await res.json();
+                } else {
+                    data = { detail: await res.text() };
+                }
+
+                if (res.status >= 400) {
+                    alert(data.detail || "验证码发送失败");
+                    clearInterval(timer);
+                    sendBtn.disabled = false;
+                    sendBtn.textContent = "获取验证码";
+                } else {
+                    alert("验证码发送成功，请前往您的邮箱（或控制台）查收！");
+                }
+            } catch (err) {
+                alert("无法连接服务器，请稍后重试");
+                clearInterval(timer);
+                sendBtn.disabled = false;
+                sendBtn.textContent = "获取验证码";
+            }
+        });
+
+        // 提交表单 (登录/注册)
         formEl.addEventListener("submit", async () => {
             errorEl.style.display = "none";
             const email = document.getElementById("apple-auth-email").value.trim();
             const password = document.getElementById("apple-auth-password").value;
+            const code = codeInput.value.trim();
             
             const url = isLoginMode ? "/api/auth/login" : "/api/auth/register";
+            const body = isLoginMode 
+                ? { email, password }
+                : { email, password, code };
+
             try {
                 const res = await originalFetch(url, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ email, password })
+                    body: JSON.stringify(body)
                 });
                 
                 let data = {};
@@ -291,7 +359,6 @@
                     localStorage.setItem("auth_user_email", data.user.email);
                     hideLoginModal();
                     updateAuthState();
-                    // 刷新页面以载入最新的个人画布和数据
                     window.location.reload();
                 }
             } catch (err) {
@@ -309,15 +376,14 @@
         pill.className = "apple-status-pill";
         pill.innerHTML = `
             <div class="apple-status-dot" id="apple-status-dot"></div>
-            <span id="apple-status-text">未登录 (本地模式)</span>
+            <span id="apple-status-text">未登录</span>
         `;
         document.body.appendChild(pill);
 
         pill.addEventListener("click", () => {
             const token = localStorage.getItem("auth_token");
             if (token) {
-                // 如果已登录，点击注销
-                if (confirm("确定要退出登录，切换回本地演示模式吗？")) {
+                if (confirm("确定要退出登录并重新登录吗？")) {
                     localStorage.removeItem("auth_token");
                     localStorage.removeItem("auth_user_email");
                     updateAuthState();
@@ -338,20 +404,23 @@
 
         if (token && email && dot && text) {
             dot.classList.add("active");
-            text.textContent = `已登录: ${email}`;
+            text.textContent = `账户: ${email}`;
         } else if (dot && text) {
             dot.classList.remove("active");
-            text.textContent = "未登录 (本地模式)";
+            text.textContent = "账户: 未登录";
         }
     }
 
-    // 全局导出显隐方法，支持 iframe 子页面通过 window.parent.showLoginModal() 调用
+    // 导出方法
     window.showLoginModal = function() {
         const overlay = document.getElementById("apple-auth-overlay");
         if (overlay) overlay.classList.add("active");
     };
 
     window.hideLoginModal = function() {
+        // 强制登录状态下，没有 token 不允许通过任何途径隐藏模态框
+        const token = localStorage.getItem("auth_token");
+        if (!token) return;
         const overlay = document.getElementById("apple-auth-overlay");
         if (overlay) overlay.classList.remove("active");
     };
