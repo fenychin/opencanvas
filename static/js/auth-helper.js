@@ -273,7 +273,16 @@
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ email, password })
                 });
-                const data = await res.json();
+                
+                let data = {};
+                const contentType = res.headers.get("content-type") || "";
+                if (contentType.includes("application/json")) {
+                    data = await res.json();
+                } else {
+                    const text = await res.text();
+                    data = { detail: text || `HTTP ${res.status} Error` };
+                }
+
                 if (res.status >= 400) {
                     errorEl.textContent = data.detail || "请求失败，请稍后重试";
                     errorEl.style.display = "block";
