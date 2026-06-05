@@ -371,28 +371,58 @@
     // 动态注入状态胶囊
     function injectStatusPill() {
         if (document.getElementById("apple-status-pill")) return;
-        const pill = document.createElement("div");
-        pill.id = "apple-status-pill";
-        pill.className = "apple-status-pill";
-        pill.innerHTML = `
-            <div class="apple-status-dot" id="apple-status-dot"></div>
-            <span id="apple-status-text">未登录</span>
-        `;
-        document.body.appendChild(pill);
+        
+        const sideActions = document.querySelector(".side-actions");
+        if (sideActions) {
+            // 侧栏存在，将其作为侧栏按钮注入，完美融入侧栏折叠/收缩动画
+            const pill = document.createElement("button");
+            pill.id = "apple-status-pill";
+            pill.className = "side-pill";
+            pill.type = "button";
+            pill.title = "账户状态";
+            pill.style.position = "relative";
+            
+            pill.innerHTML = `
+                <div style="position: relative; width: 16px; height: 16px; flex: 0 0 16px; display: flex; align-items: center; justify-content: center;">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 16px; height: 16px; flex: 0 0 16px;">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="12" cy="7" r="4"></circle>
+                    </svg>
+                    <div class="apple-status-dot" id="apple-status-dot" style="position: absolute; bottom: -2px; right: -2px; width: 7px; height: 7px; border-radius: 50%; background: #ff453a; border: 1.5px solid var(--sidebar-bg, #fff); z-index: 2; transition: background-color 0.25s;"></div>
+                </div>
+                <span class="side-pill-text" id="apple-status-text" style="text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">未登录</span>
+            `;
+            
+            // 插入到 side-actions 的最上方
+            sideActions.insertBefore(pill, sideActions.firstChild);
+        } else {
+            // 兜底方案：没有侧栏的常规悬浮模式
+            const pill = document.createElement("div");
+            pill.id = "apple-status-pill";
+            pill.className = "apple-status-pill";
+            pill.innerHTML = `
+                <div class="apple-status-dot" id="apple-status-dot"></div>
+                <span id="apple-status-text">未登录</span>
+            `;
+            document.body.appendChild(pill);
+        }
 
-        pill.addEventListener("click", () => {
-            const token = localStorage.getItem("auth_token");
-            if (token) {
-                if (confirm("确定要退出登录并重新登录吗？")) {
-                    localStorage.removeItem("auth_token");
-                    localStorage.removeItem("auth_user_email");
-                    updateAuthState();
-                    window.location.reload();
+        const pillEl = document.getElementById("apple-status-pill");
+        if (pillEl) {
+            pillEl.addEventListener("click", () => {
+                const token = localStorage.getItem("auth_token");
+                if (token) {
+                    if (confirm("确定要退出登录并重新登录吗？")) {
+                        localStorage.removeItem("auth_token");
+                        localStorage.removeItem("auth_user_email");
+                        updateAuthState();
+                        window.location.reload();
+                    }
+                } else {
+                    showLoginModal();
                 }
-            } else {
-                showLoginModal();
-            }
-        });
+            });
+        }
     }
 
     // 更新登录态显示
@@ -404,10 +434,22 @@
 
         if (token && email && dot && text) {
             dot.classList.add("active");
-            text.textContent = `账户: ${email}`;
+            dot.style.backgroundColor = "#30d158"; // 绿色
+            text.textContent = email;
+            
+            const pill = document.getElementById("apple-status-pill");
+            if (pill) {
+                pill.title = `已登录: ${email} (点击退出)`;
+            }
         } else if (dot && text) {
             dot.classList.remove("active");
-            text.textContent = "账户: 未登录";
+            dot.style.backgroundColor = "#ff453a"; // 红色
+            text.textContent = "未登录";
+            
+            const pill = document.getElementById("apple-status-pill");
+            if (pill) {
+                pill.title = "点击登录";
+            }
         }
     }
 
