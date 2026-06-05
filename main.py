@@ -9506,6 +9506,77 @@ def runninghub_collect_workflow_fields(workflow_json):
             })
     return fields
 
+# --- 用户鉴权 (注册/登录) API ---
+class RegisterPayload(BaseModel):
+    email: str
+    password: str
+
+class LoginPayload(BaseModel):
+    email: str
+    password: str
+
+@app.post("/api/auth/register")
+async def register(payload: RegisterPayload):
+    email = payload.email.strip().lower()
+    password = payload.password
+    
+    if not re.match(r"^[^@]+@[^@]+\.[^@]+$", email):
+        raise HTTPException(status_code=400, detail="邮箱格式不正确")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="密码长度必须至少为6位")
+        
+    db = SessionLocal()
+    try:
+        existing = db.query(User).filter(User.email == email).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="该邮箱已被注册")
+            
+        from core.auth import get_password_hash
+        user_id = "user_" + uuid.uuid4().hex[:12]
+        new_user = User(
+            id=user_id,
+            email=email,
+            hashed_password=get_password_hash(password),
+            created_at=now_ms(),
+            status="active"
+        )
+        db.add(new_user)
+        db.commit()
+        
+        from core.auth import create_access_token
+        token = create_access_token({"sub": user_id})
+        return {"success": True, "token": token, "user": {"id": user_id, "email": email}}
+    finally:
+        db.close()
+
+@app.post("/api/auth/login")
+async def login(payload: LoginPayload):
+    email = payload.email.strip().lower()
+    password = payload.password
+    
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=400, detail="邮箱或密码错误")
+            
+        from core.auth import verify_password
+        if not verify_password(password, user.hashed_password):
+            raise HTTPException(status_code=400, detail="邮箱或密码错误")
+            
+        if user.status != "active":
+            raise HTTPException(status_code=403, detail="该账户已被停用")
+            
+        from core.auth import create_access_token
+        token = create_access_token({"sub": user.id})
+        return {"success": True, "token": token, "user": {"id": user.id, "email": user.email}}
+    finally:
+        db.close()
+
+@app.get("/api/auth/me")
+async def get_current_user_info(current_user: User = Depends(get_current_user)):
+    return {"id": current_user.id, "email": current_user.email}
+
 # --- APIRouter Mounts ---
 from routers.comfyui import router as comfyui_router
 from routers.jimeng import router as jimeng_router
