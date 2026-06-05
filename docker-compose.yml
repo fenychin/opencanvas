@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  opencanvas:
+    build: .
+    container_name: opencanvas-test
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./assets:/app/assets
+      - ./output:/app/output
+    environment:
+      - TZ=Asia/Shanghai
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-tunnel
+    restart: always
+    command: tunnel --no-autoupdate run --token eyJhIjoiZjA5MzM3NDI3MDBlYjc4NTdiOGM1MThlNzI3ODNlY2EiLCJ0IjoiMzBkOGFkNzUtMGVmMy00MGY1LTgyYTQtODQ0OWJhODMzM2IwIiwicyI6IlpESTBZVGRrT0RJdE1ERXlOUzAwT1RNekxXSXlNVE10WVdRM01qY3pZVFJpWm1NMSJ9
+    depends_on:
+      - opencanvas
