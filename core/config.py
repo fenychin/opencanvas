@@ -485,3 +485,13 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 BACKEND_LOCAL_LOAD = {addr: 0 for addr in COMFYUI_INSTANCES}
+
+# 数据库与缓存配置
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(DATA_DIR, 'canvas.db')}")
+REDIS_URL = os.getenv("REDIS_URL", "")
+
+# JWT 鉴权配置
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "opencanvas-super-secret-key-change-me-in-production")
+JWT_ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7 # 7天默认过期时间
+

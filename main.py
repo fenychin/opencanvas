@@ -33,6 +33,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from fastapi import Depends
+from core.database import get_db, SessionLocal
+from core.models import Canvas as CanvasModel, Conversation
+from core.models import User
+from core.auth import get_current_user
+
 
 QUIET_ACCESS_PATHS = {
     "/api/queue_status",
@@ -63,12 +70,17 @@ logging.getLogger("uvicorn.access").addFilter(QuietAccessLogFilter())
 
 app = FastAPI()
 
+cors_origins_raw = os.getenv("CORS_ORIGINS", "")
+cors_origins = [s.strip() for s in cors_origins_raw.split(",") if s.strip()] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.middleware("http")
 async def disable_cache_middleware(request: Request, call_next):
@@ -1612,213 +1624,18 @@ def schedule_self_restart(delay_seconds: int = 3) -> bool:
         logging.exception("schedule_self_restart failed: %s", exc)
         return False
 
-class UpdateRequest(BaseModel):
-    auto_restart: bool = False
-    restart_delay: int = 3
-
+# 升级与回滚接口已安全禁用
 @app.post("/api/update-from-github")
-def update_from_github(req: UpdateRequest = UpdateRequest()):
-    if not UPDATE_LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
-    staging_root = ""
-    try:
-        tree_data = github_json(GITHUB_TREE_URL, use_etag_cache=True)
-        entries = tree_data.get("tree") or []
-        static_files = []
-        root_files = []
-        for entry in entries:
-            path = str(entry.get("path") or "").replace("\\", "/")
-            if entry.get("type") == "blob" and update_allowed_file(path):
-                if path.startswith("static/"):
-                    static_files.append(path)
-                else:
-                    root_files.append(path)
-        if "main.py" not in root_files:
-            root_files.append("main.py")
-        if "VERSION" not in root_files:
-            root_files.append("VERSION")
-        static_files = sorted(set(static_files))
-        root_files = sorted(set(root_files))
-        files = root_files + static_files
-        if not static_files:
-            raise RuntimeError("GitHub 未返回 static 文件，已取消更新")
-
-        backup_root = os.path.join(DATA_DIR, "update_backups", time.strftime("%Y%m%d-%H%M%S"))
-        staging_root = os.path.join(DATA_DIR, "update_staging", f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}")
-        download_github_update_files(files, staging_root)
-
-        updated = []
-        for rel in root_files:
-            target = safe_update_target(rel)
-            if os.path.exists(target):
-                backup_path = os.path.join(backup_root, *rel.split("/"))
-                os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-                shutil.copy2(target, backup_path)
-
-        staged_static_dir = os.path.join(staging_root, "static")
-        if not os.path.isdir(staged_static_dir):
-            raise RuntimeError("GitHub static 暂存目录不存在，已取消更新")
-        static_dir = safe_static_dir()
-        backup_static_dir = os.path.join(backup_root, "static")
-        if os.path.isdir(static_dir):
-            os.makedirs(os.path.dirname(backup_static_dir), exist_ok=True)
-            shutil.copytree(static_dir, backup_static_dir)
-            shutil.rmtree(static_dir)
-        try:
-            shutil.copytree(staged_static_dir, static_dir)
-        except Exception:
-            if os.path.isdir(static_dir):
-                shutil.rmtree(static_dir, ignore_errors=True)
-            if os.path.isdir(backup_static_dir):
-                shutil.copytree(backup_static_dir, static_dir)
-            raise
-        updated.extend(static_files)
-
-        replaced_root_files = []
-        try:
-            for rel in root_files:
-                target = safe_update_target(rel)
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                temp_path = f"{target}.update_tmp"
-                shutil.copy2(os.path.join(staging_root, *rel.split("/")), temp_path)
-                os.replace(temp_path, target)
-                replaced_root_files.append(rel)
-                updated.append(rel)
-        except Exception:
-            for rel in reversed(replaced_root_files):
-                backup_path = os.path.join(backup_root, *rel.split("/"))
-                target = safe_update_target(rel)
-                if os.path.exists(backup_path):
-                    temp_path = f"{target}.rollback_tmp"
-                    shutil.copy2(backup_path, temp_path)
-                    os.replace(temp_path, target)
-            if os.path.isdir(static_dir):
-                shutil.rmtree(static_dir, ignore_errors=True)
-            if os.path.isdir(backup_static_dir):
-                shutil.copytree(backup_static_dir, static_dir)
-            raise
-
-        restart_scheduled = False
-        if req.auto_restart and updated:
-            restart_scheduled = schedule_self_restart(req.restart_delay)
-        return {
-            "ok": True,
-            "updated": updated,
-            "count": len(updated),
-            "backup_dir": backup_root if os.path.exists(backup_root) else "",
-            "restart_required": True,
-            "restart_scheduled": restart_scheduled,
-        }
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"GitHub 下载失败：HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"无法连接 GitHub：{exc.reason}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"更新失败：{exc}") from exc
-    finally:
-        if staging_root and os.path.isdir(staging_root):
-            shutil.rmtree(staging_root, ignore_errors=True)
-        UPDATE_LOCK.release()
-
-def list_update_backups() -> List[Dict[str, Any]]:
-    root = os.path.join(DATA_DIR, "update_backups")
-    if not os.path.isdir(root):
-        return []
-    items = []
-    for name in sorted(os.listdir(root), reverse=True):
-        bp = os.path.join(root, name)
-        if not os.path.isdir(bp):
-            continue
-        file_count = 0
-        for _, _, fs in os.walk(bp):
-            file_count += len(fs)
-        try:
-            created_at = os.path.getmtime(bp)
-        except OSError:
-            created_at = 0.0
-        items.append({
-            "name": name,
-            "file_count": file_count,
-            "created_at": created_at,
-        })
-    return items
+def update_from_github():
+    raise HTTPException(status_code=501, detail="云端部署模式下自动更新接口已禁用")
 
 @app.get("/api/update-backups")
 def get_update_backups():
-    return {"backups": list_update_backups()}
-
-class RollbackRequest(BaseModel):
-    name: str = ""
-    auto_restart: bool = False
-    restart_delay: int = 3
+    raise HTTPException(status_code=501, detail="云端部署模式下自动更新接口已禁用")
 
 @app.post("/api/update-rollback")
-def rollback_update(req: RollbackRequest):
-    if not req.name:
-        raise HTTPException(status_code=400, detail="缺少备份名称")
-    if not UPDATE_LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
-    try:
-        backup_root_abs = os.path.abspath(os.path.join(DATA_DIR, "update_backups"))
-        backup_dir = os.path.abspath(os.path.join(backup_root_abs, req.name))
-        if os.path.commonpath([backup_root_abs, backup_dir]) != backup_root_abs:
-            raise HTTPException(status_code=400, detail="备份路径不安全")
-        if not os.path.isdir(backup_dir):
-            raise HTTPException(status_code=404, detail="备份不存在")
-        restored = []
-        skipped = []
-        backup_static_dir = os.path.join(backup_dir, "static")
-        if os.path.isdir(backup_static_dir):
-            static_dir = safe_static_dir()
-            if os.path.isdir(static_dir):
-                shutil.rmtree(static_dir)
-            try:
-                shutil.copytree(backup_static_dir, static_dir)
-            except Exception:
-                if os.path.isdir(static_dir):
-                    shutil.rmtree(static_dir, ignore_errors=True)
-                raise
-            for dirpath, _, filenames in os.walk(backup_static_dir):
-                for fn in filenames:
-                    src = os.path.join(dirpath, fn)
-                    restored.append(os.path.relpath(src, backup_dir).replace("\\", "/"))
-        for dirpath, _, filenames in os.walk(backup_dir):
-            for fn in filenames:
-                src = os.path.join(dirpath, fn)
-                rel = os.path.relpath(src, backup_dir).replace("\\", "/")
-                if rel.startswith("static/"):
-                    continue
-                if not update_allowed_file(rel):
-                    skipped.append(rel)
-                    continue
-                try:
-                    target = safe_update_target(rel)
-                except ValueError:
-                    skipped.append(rel)
-                    continue
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                temp_path = f"{target}.rollback_tmp"
-                with open(src, "rb") as fin, open(temp_path, "wb") as fout:
-                    shutil.copyfileobj(fin, fout)
-                os.replace(temp_path, target)
-                restored.append(rel)
-        restart_scheduled = False
-        if req.auto_restart and restored:
-            restart_scheduled = schedule_self_restart(req.restart_delay)
-        return {
-            "ok": True,
-            "restored": restored,
-            "skipped": skipped,
-            "count": len(restored),
-            "restart_required": True,
-            "restart_scheduled": restart_scheduled,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"回滚失败：{exc}") from exc
-    finally:
-        UPDATE_LOCK.release()
+def rollback_update():
+    raise HTTPException(status_code=501, detail="云端部署模式下自动更新接口已禁用")
 
 class GenerateRequest(BaseModel):
     prompt: str = ""
@@ -2370,10 +2187,25 @@ def now_ms():
     return int(time.time() * 1000)
 
 def save_conversation(user_id, conversation):
-    with CONVERSATION_LOCK:
-        path = conversation_path(user_id, conversation["id"])
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(conversation, f, ensure_ascii=False, indent=2)
+    db = SessionLocal()
+    try:
+        conv = db.query(Conversation).filter(Conversation.user_id == user_id, Conversation.id == conversation["id"]).first()
+        if not conv:
+            conv = Conversation(
+                id=conversation["id"],
+                user_id=user_id,
+                title=conversation.get("title", "新对话"),
+                messages_json=json.dumps(conversation.get("messages", []), ensure_ascii=False),
+                updated_at=now_ms()
+            )
+            db.add(conv)
+        else:
+            conv.messages_json = json.dumps(conversation.get("messages", []), ensure_ascii=False)
+            conv.title = conversation.get("title", conv.title)
+            conv.updated_at = now_ms()
+        db.commit()
+    finally:
+        db.close()
 
 def new_conversation(user_id, title="新对话"):
     timestamp = now_ms()
@@ -2388,134 +2220,168 @@ def new_conversation(user_id, title="新对话"):
     return conversation
 
 def load_conversation(user_id, conversation_id):
-    path = conversation_path(user_id, conversation_id)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="对话不存在")
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    db = SessionLocal()
+    try:
+        conv = db.query(Conversation).filter(Conversation.user_id == user_id, Conversation.id == conversation_id).first()
+        if not conv:
+            raise HTTPException(status_code=404, detail="对话不存在")
+        return {
+            "id": conv.id,
+            "title": conv.title,
+            "messages": conv.messages,
+            "updated_at": conv.updated_at
+        }
+    finally:
+        db.close()
 
 def list_conversations(user_id):
-    records = []
-    for filename in os.listdir(user_dir(user_id)):
-        if not filename.endswith(".json"):
-            continue
-        path = os.path.join(user_dir(user_id), filename)
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception:
-            continue
-        messages = data.get("messages", [])
-        last_message = next((m for m in reversed(messages) if m.get("role") != "system"), None)
-        records.append({
-            "id": data.get("id"),
-            "title": data.get("title", "新对话"),
-            "created_at": data.get("created_at", 0),
-            "updated_at": data.get("updated_at", 0),
-            "last_message": (last_message or {}).get("content", ""),
-        })
-    return sorted(records, key=lambda item: item["updated_at"], reverse=True)
+    db = SessionLocal()
+    try:
+        convs = db.query(Conversation).filter(Conversation.user_id == user_id).order_by(Conversation.updated_at.desc()).all()
+        records = []
+        for conv in convs:
+            messages = conv.messages
+            last_message = next((m for m in reversed(messages) if m.get("role") != "system"), None)
+            records.append({
+                "id": conv.id,
+                "title": conv.title,
+                "created_at": conv.updated_at,
+                "updated_at": conv.updated_at,
+                "last_message": (last_message or {}).get("content", ""),
+            })
+        return records
+    finally:
+        db.close()
 
 def canvas_path(canvas_id):
-    cleaned = re.sub(r"[^a-zA-Z0-9_-]", "", canvas_id or "")
-    if not cleaned:
-        raise HTTPException(status_code=400, detail="无效的画布 ID")
-    return os.path.join(CANVAS_DIR, f"{cleaned}.json")
+    return canvas_id
 
 def save_canvas(canvas):
-    canvas["updated_at"] = now_ms()
-    with CANVAS_LOCK:
-        with open(canvas_path(canvas["id"]), 'w', encoding='utf-8') as f:
-            json.dump(canvas, f, ensure_ascii=False, indent=2)
+    db = SessionLocal()
+    try:
+        c = db.query(CanvasModel).filter(CanvasModel.id == canvas["id"]).first()
+        user_id = canvas.get("user_id", "default_user")
+        if not c:
+            c = CanvasModel(
+                id=canvas["id"],
+                user_id=user_id,
+                title=canvas.get("title", "未命名画布"),
+                data_json=json.dumps(canvas.get("data", {}), ensure_ascii=False),
+                is_trash=canvas.get("is_trash", False),
+                deleted_at=canvas.get("deleted_at"),
+                updated_at=now_ms()
+            )
+            db.add(c)
+        else:
+            c.title = canvas.get("title", c.title)
+            c.data_json = json.dumps(canvas.get("data", {}), ensure_ascii=False)
+            c.is_trash = canvas.get("is_trash", c.is_trash)
+            c.deleted_at = canvas.get("deleted_at", c.deleted_at)
+            c.updated_at = now_ms()
+            if "user_id" in canvas:
+                c.user_id = canvas["user_id"]
+        db.commit()
+    finally:
+        db.close()
 
 def normalize_canvas_kind(kind="classic"):
     return "smart" if str(kind or "").strip().lower() == "smart" else "classic"
 
-def new_canvas(title="未命名画布", icon="layers", kind="classic"):
+def new_canvas(user_id, title="未命名画布", icon="layers", kind="classic"):
     timestamp = now_ms()
     canvas_kind = normalize_canvas_kind(kind)
-    canvas = {
+    c_title = (title or ("智能画布" if canvas_kind == "smart" else "未命名画布"))[:80]
+    
+    initial_data = {
         "id": uuid.uuid4().hex,
-        "title": (title or ("智能画布" if canvas_kind == "smart" else "未命名画布"))[:80],
-        "icon": (icon or ("sparkles" if canvas_kind == "smart" else "🧩"))[:32],
+        "title": c_title,
+        "icon": icon or "layers",
         "kind": canvas_kind,
-        "created_at": timestamp,
-        "updated_at": timestamp,
         "nodes": [],
         "connections": [],
         "viewport": {"x": 0, "y": 0, "scale": 1},
+        "logs": [],
+        "settings": {}
+    }
+    
+    canvas = {
+        "id": initial_data["id"],
+        "user_id": user_id,
+        "title": c_title,
+        "data": initial_data,
+        "is_trash": False,
+        "deleted_at": None,
+        "updated_at": timestamp
     }
     save_canvas(canvas)
     return canvas
 
 def load_canvas(canvas_id):
-    path = canvas_path(canvas_id)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="画布不存在")
-    with open(path, 'r', encoding='utf-8') as f:
-        canvas = json.load(f)
-    if canvas.get("deleted_at"):
-        raise HTTPException(status_code=404, detail="画布已在回收站")
-    return canvas
+    db = SessionLocal()
+    try:
+        canvas = db.query(CanvasModel).filter(CanvasModel.id == canvas_id).first()
+        if not canvas:
+            raise HTTPException(status_code=404, detail="画布不存在")
+        if canvas.is_trash:
+            raise HTTPException(status_code=404, detail="画布已在回收站")
+        return {
+            "id": canvas.id,
+            "user_id": canvas.user_id,
+            "title": canvas.title,
+            "data": canvas.data,
+            "is_trash": canvas.is_trash,
+            "deleted_at": canvas.deleted_at,
+            "updated_at": canvas.updated_at
+        }
+    finally:
+        db.close()
 
 def load_canvas_any(canvas_id):
-    path = canvas_path(canvas_id)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="画布不存在")
-    with open(path, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    db = SessionLocal()
+    try:
+        canvas = db.query(CanvasModel).filter(CanvasModel.id == canvas_id).first()
+        if not canvas:
+            raise HTTPException(status_code=404, detail="画布不存在")
+        return {
+            "id": canvas.id,
+            "user_id": canvas.user_id,
+            "title": canvas.title,
+            "data": canvas.data,
+            "is_trash": canvas.is_trash,
+            "deleted_at": canvas.deleted_at,
+            "updated_at": canvas.updated_at
+        }
+    finally:
+        db.close()
 
-def canvas_record(data):
-    return {
-        "id": data.get("id"),
-        "title": data.get("title", "未命名画布"),
-        "icon": data.get("icon", "🧩"),
-        "kind": normalize_canvas_kind(data.get("kind")),
-        "created_at": data.get("created_at", 0),
-        "updated_at": data.get("updated_at", 0),
-        "deleted_at": data.get("deleted_at", 0),
-        "node_count": len(data.get("nodes", [])),
-    }
+def iter_canvas_records(user_id, include_deleted=False):
+    db = SessionLocal()
+    try:
+        canvases = db.query(CanvasModel).filter(
+            CanvasModel.user_id == user_id,
+            CanvasModel.is_trash == include_deleted
+        ).all()
+        records = []
+        for canvas in canvases:
+            # 转换为兼容前端的元数据记录格式
+            records.append({
+                "id": canvas.id,
+                "title": canvas.title,
+                "icon": canvas.data.get("icon", "layers"),
+                "kind": canvas.data.get("kind", "classic"),
+                "updated_at": canvas.updated_at,
+                "deleted_at": canvas.deleted_at
+            })
+        return records
+    finally:
+        db.close()
 
-def cleanup_expired_canvas_trash():
-    cutoff = now_ms() - CANVAS_TRASH_RETENTION_MS
-    with CANVAS_LOCK:
-        for filename in os.listdir(CANVAS_DIR):
-            if not filename.endswith(".json"):
-                continue
-            path = os.path.join(CANVAS_DIR, filename)
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                deleted_at = int(data.get("deleted_at") or 0)
-                if deleted_at and deleted_at < cutoff:
-                    os.remove(path)
-            except Exception:
-                continue
-
-def iter_canvas_records(include_deleted=False):
-    cleanup_expired_canvas_trash()
-    records = []
-    for filename in os.listdir(CANVAS_DIR):
-        if not filename.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(CANVAS_DIR, filename), 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception:
-            continue
-        is_deleted = bool(data.get("deleted_at"))
-        if include_deleted != is_deleted:
-            continue
-        records.append(canvas_record(data))
-    return records
-
-def list_canvases():
-    records = iter_canvas_records(include_deleted=False)
+def list_canvases(user_id):
+    records = iter_canvas_records(user_id, include_deleted=False)
     return sorted(records, key=lambda item: item["updated_at"], reverse=True)
 
-def list_deleted_canvases():
-    records = iter_canvas_records(include_deleted=True)
+def list_deleted_canvases(user_id):
+    records = iter_canvas_records(user_id, include_deleted=True)
     return sorted(records, key=lambda item: item["deleted_at"], reverse=True)
 
 def display_title(text):
@@ -6014,8 +5880,20 @@ def download_output(url: str, name: str = "", inline: bool = False):
 async def upload_image(files: List[UploadFile] = File(...)):
     uploaded_files = []
     files_content = []
+    
+    # 允许上传的文件格式白名单
+    allowed_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".webm", ".mov"}
+    max_file_size = 20 * 1024 * 1024 # 最大 20MB
+    
     for file in files:
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in allowed_exts:
+            raise HTTPException(status_code=400, detail=f"不支持上传此文件类型: {ext}")
+            
         content = await file.read()
+        if len(content) > max_file_size:
+            raise HTTPException(status_code=400, detail=f"文件大小超出限制，最大允许 20MB")
+            
         files_content.append((file, content))
 
     for file, content in files_content:
@@ -6037,6 +5915,7 @@ async def upload_image(files: List[UploadFile] = File(...)):
             raise HTTPException(status_code=500, detail="Failed to upload to any backend")
 
     return {"files": uploaded_files}
+
 
 @app.post("/api/ai/upload")
 async def upload_ai_reference(files: List[UploadFile] = File(...)):
@@ -7723,45 +7602,51 @@ async def canvas_llm(payload: CanvasLLMRequest):
 # --- 对话管理 ---
 
 @app.get("/api/conversations")
-async def conversations(request: Request, x_user_id: str = Header(default="")):
-    user_id = safe_user_id(x_user_id, request)
+async def conversations(current_user: User = Depends(get_current_user)):
+    user_id = current_user.id
     return {"user_id": user_id, "conversations": list_conversations(user_id)}
 
 @app.post("/api/conversations")
-async def create_conversation(payload: ConversationCreateRequest, request: Request, x_user_id: str = Header(default="")):
-    user_id = safe_user_id(x_user_id, request)
+async def create_conversation(payload: ConversationCreateRequest, current_user: User = Depends(get_current_user)):
+    user_id = current_user.id
     return {"conversation": new_conversation(user_id, payload.title)}
 
 @app.get("/api/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str, request: Request, x_user_id: str = Header(default="")):
-    user_id = safe_user_id(x_user_id, request)
+async def get_conversation(conversation_id: str, current_user: User = Depends(get_current_user)):
+    user_id = current_user.id
     return {"conversation": load_conversation(user_id, conversation_id)}
 
 @app.delete("/api/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str, request: Request, x_user_id: str = Header(default="")):
-    user_id = safe_user_id(x_user_id, request)
-    path = conversation_path(user_id, conversation_id)
-    if os.path.exists(path):
-        os.remove(path)
+async def delete_conversation(conversation_id: str, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        conv = db.query(Conversation).filter(Conversation.user_id == current_user.id, Conversation.id == conversation_id).first()
+        if conv:
+            db.delete(conv)
+            db.commit()
+    finally:
+        db.close()
     return {"ok": True}
 
 # --- 画布管理 ---
 
 @app.get("/api/canvases")
-async def canvases():
-    return {"canvases": list_canvases()}
+async def canvases(current_user: User = Depends(get_current_user)):
+    return {"canvases": list_canvases(current_user.id)}
 
 @app.get("/api/canvases/trash")
-async def trashed_canvases():
-    return {"canvases": list_deleted_canvases(), "retention_days": 30}
+async def trashed_canvases(current_user: User = Depends(get_current_user)):
+    return {"canvases": list_deleted_canvases(current_user.id), "retention_days": 30}
 
 @app.post("/api/canvases")
-async def create_canvas(payload: CanvasCreateRequest):
-    return {"canvas": new_canvas(payload.title, payload.icon, payload.kind)}
+async def create_canvas(payload: CanvasCreateRequest, current_user: User = Depends(get_current_user)):
+    return {"canvas": new_canvas(current_user.id, payload.title, payload.icon, payload.kind)}
 
 @app.get("/api/canvases/{canvas_id}/meta")
-async def get_canvas_meta(canvas_id: str):
+async def get_canvas_meta(canvas_id: str, current_user: User = Depends(get_current_user)):
     canvas = load_canvas(canvas_id)
+    if canvas.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问该画布")
     return {
         "id": canvas.get("id"),
         "updated_at": canvas.get("updated_at", 0),
@@ -7771,12 +7656,17 @@ async def get_canvas_meta(canvas_id: str):
     }
 
 @app.get("/api/canvases/{canvas_id}")
-async def get_canvas(canvas_id: str):
-    return {"canvas": load_canvas(canvas_id)}
+async def get_canvas(canvas_id: str, current_user: User = Depends(get_current_user)):
+    canvas = load_canvas(canvas_id)
+    if canvas.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问该画布")
+    return {"canvas": canvas}
 
 @app.post("/api/canvases/{canvas_id}/touch")
-async def touch_canvas(canvas_id: str):
+async def touch_canvas(canvas_id: str, current_user: User = Depends(get_current_user)):
     canvas = load_canvas(canvas_id)
+    if canvas.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="无权访问该画布")
     save_canvas(canvas)
     return {"canvas": canvas_record(canvas), "updated_at": canvas.get("updated_at", 0)}
 
@@ -8369,8 +8259,10 @@ async def batch_crop_asset_library_items(payload: AssetLibraryBatchCropRequest):
     return {"library": lib, "added": len(added), "items": added}
 
 @app.put("/api/canvases/{canvas_id}")
-async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
+async def update_canvas(canvas_id: str, payload: CanvasSaveRequest, current_user: User = Depends(get_current_user)):
     canvas = load_canvas(canvas_id)
+    if canvas.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="无权修改该画布")
     current_updated_at = int(canvas.get("updated_at") or 0)
     if payload.base_updated_at and current_updated_at and int(payload.base_updated_at) < current_updated_at:
         raise HTTPException(status_code=409, detail={
@@ -8394,26 +8286,35 @@ async def update_canvas(canvas_id: str, payload: CanvasSaveRequest):
     return {"canvas": canvas}
 
 @app.delete("/api/canvases/{canvas_id}")
-async def delete_canvas(canvas_id: str):
+async def delete_canvas(canvas_id: str, current_user: User = Depends(get_current_user)):
     canvas = load_canvas_any(canvas_id)
+    if canvas.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="无权删除该画布")
     if not canvas.get("deleted_at"):
         canvas["deleted_at"] = now_ms()
         save_canvas(canvas)
     return {"ok": True}
 
 @app.post("/api/canvases/{canvas_id}/restore")
-async def restore_canvas(canvas_id: str):
+async def restore_canvas(canvas_id: str, current_user: User = Depends(get_current_user)):
     canvas = load_canvas_any(canvas_id)
+    if canvas.get("user_id") != current_user.id:
+        raise HTTPException(status_code=403, detail="无权恢复该画布")
     if canvas.get("deleted_at"):
         canvas.pop("deleted_at", None)
         save_canvas(canvas)
     return {"canvas": canvas}
 
 @app.delete("/api/canvases/{canvas_id}/purge")
-async def purge_canvas(canvas_id: str):
-    path = canvas_path(canvas_id)
-    if os.path.exists(path):
-        os.remove(path)
+async def purge_canvas(canvas_id: str, current_user: User = Depends(get_current_user)):
+    db = SessionLocal()
+    try:
+        c = db.query(CanvasModel).filter(CanvasModel.user_id == current_user.id, CanvasModel.id == canvas_id).first()
+        if c:
+            db.delete(c)
+            db.commit()
+    finally:
+        db.close()
     return {"ok": True}
 
 # --- GPT 对话 ---
