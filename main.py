@@ -9574,10 +9574,17 @@ async def send_code(payload: SendCodePayload):
     }
     
     success = send_verification_email(email, code)
-    if not success and os.getenv("SMTP_HOST"):
+    
+    # 检查是否配置了发信服务
+    smtp_configured = bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
+    if not success and smtp_configured:
         raise HTTPException(status_code=500, detail="验证码发送失败，请稍后重试")
         
-    return {"success": True, "msg": "验证码已发送"}
+    resp = {"success": True, "msg": "验证码已发送"}
+    if not smtp_configured:
+        resp["debug_code"] = code
+        
+    return resp
 
 @app.post("/api/auth/register")
 async def register(payload: RegisterPayload):
@@ -9590,14 +9597,20 @@ async def register(payload: RegisterPayload):
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="密码长度必须至少为6位")
         
-    # 校验验证码
-    cached = VERIFICATION_CODES.get(email)
-    if not cached:
-        raise HTTPException(status_code=400, detail="请先获取验证码")
-    if time.time() > cached["expires_at"]:
-        raise HTTPException(status_code=400, detail="验证码已过期")
-    if cached["code"] != code:
-        raise HTTPException(status_code=400, detail="验证码不正确")
+    # 检查是否配置了发信服务
+    smtp_configured = bool(os.getenv("SMTP_HOST") and os.getenv("SMTP_USER") and os.getenv("SMTP_PASSWORD"))
+    
+    # 校验验证码：若未配置真实发信且为测试码 "123456"，则直接允许绕过
+    is_test_bypass = (not smtp_configured) and (code == "123456")
+    
+    if not is_test_bypass:
+        cached = VERIFICATION_CODES.get(email)
+        if not cached:
+            raise HTTPException(status_code=400, detail="请先获取验证码")
+        if time.time() > cached["expires_at"]:
+            raise HTTPException(status_code=400, detail="验证码已过期")
+        if cached["code"] != code:
+            raise HTTPException(status_code=400, detail="验证码不正确")
         
     db = SessionLocal()
     try:

@@ -314,6 +314,18 @@
                     sendBtn.textContent = "获取验证码";
                 } else {
                     alert("验证码发送成功，请前往您的邮箱（或控制台）查收！");
+                    if (data.debug_code) {
+                        const codeInput = document.getElementById("apple-auth-code");
+                        if (codeInput) {
+                            codeInput.value = data.debug_code;
+                            const errorEl = document.getElementById("apple-auth-error-msg");
+                            if (errorEl) {
+                                errorEl.textContent = `[测试模式] 已自动填入验证码 ${data.debug_code}，或使用万能码 123456`;
+                                errorEl.style.color = "#30d158"; // 绿色提示
+                                errorEl.style.display = "block";
+                            }
+                        }
+                    }
                 }
             } catch (err) {
                 alert("无法连接服务器，请稍后重试");
